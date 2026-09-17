@@ -73,16 +73,26 @@ def _register_api_routes():
             AUDIO_EXTS = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".wma"}
             images, videos, audios = [], [], []
             if os.path.isdir(input_dir):
-                for f in os.listdir(input_dir):
-                    if os.path.isfile(os.path.join(input_dir, f)):
+                # Recurse so files in input/subfolders show up. The old
+                # os.listdir() pass only saw the top level, which is why
+                # the tile-editor dropdown looked incomplete.
+                for root, dirs, names in os.walk(input_dir):
+                    dirs[:] = [d for d in dirs if not d.startswith(".")]
+                    for f in names:
+                        if f.startswith("."):
+                            continue
+                        full = os.path.join(root, f)
+                        if not os.path.isfile(full):
+                            continue
+                        rel = os.path.relpath(full, input_dir).replace("\\", "/")
                         _, ext = os.path.splitext(f)
                         ext = ext.lower()
                         if ext in IMAGE_EXTS:
-                            images.append(f)
+                            images.append(rel)
                         elif ext in VIDEO_EXTS:
-                            videos.append(f)
+                            videos.append(rel)
                         elif ext in AUDIO_EXTS:
-                            audios.append(f)
+                            audios.append(rel)
             for lst in (images, videos, audios):
                 lst.sort()
             if request.query.get("categorized"):
