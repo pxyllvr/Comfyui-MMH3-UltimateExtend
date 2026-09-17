@@ -1345,6 +1345,60 @@ canvas.addEventListener("pointerup", (e) => {
                 window._mmh3teInputImages = await fetchInputImages();
             }
 
+            function socketLinked(name) {
+                const inp = (node.inputs || []).find((i) => i && i.name === name);
+                return !!(inp && inp.link != null);
+            }
+            function widgetVal(name) {
+                const w = (node.widgets || []).find((x) => x && x.name === name);
+                return w ? w.value : null;
+            }
+            function geometryDriven() {
+                if (socketLinked("source_width") || socketLinked("source_height") || socketLinked("source_image"))
+                    return true;
+                const mode = widgetVal("geometry_mode");
+                const sw = parseInt(widgetVal("source_width"), 10) || 0;
+                const sh = parseInt(widgetVal("source_height"), 10) || 0;
+                return mode && mode !== "manual" && sw >= 32 && sh >= 32;
+            }
+            function refsDriven() {
+                return socketLinked("references");
+            }
+            function applyDrivenGeometryPreview() {
+                if (!geometryDriven()) return;
+                const mode = widgetVal("geometry_mode") || "multiply_along_axis";
+                if (mode === "manual") return;
+                let sw = parseInt(widgetVal("source_width"), 10) || 0;
+                let sh = parseInt(widgetVal("source_height"), 10) || 0;
+                if (sw < 32 || sh < 32) return;
+                const snap = (v) => Math.max(32, Math.round(v / 32) * 32);
+                if (sw % 32) sw = snap(sw);
+                if (sh % 32) sh = snap(sh);
+                const olPct = Math.max(0, Math.min(0.45, parseFloat(widgetVal("overlap_percent")) || 0.125));
+                const fadePct = Math.max(0, Math.min(1, parseFloat(widgetVal("fade_percent")) || 0.25));
+                const plan = currentPlan();
+                const horiz = plan !== "vertical_alternating";
+                const ol = snap((horiz ? sw : sh) * olPct);
+                const fade = snap(ol * fadePct);
+                node._tiles.forEach((t, i) => {
+                    if (mode === "multiply_along_axis" && i > 0 && plan !== "4_quadrants_expand") {
+                        t.width = horiz ? sw * 2 : sw;
+                        t.height = horiz ? sh : sh * 2;
+                        t.overlap_w = horiz ? sw : 0;
+                        t.overlap_h = horiz ? 0 : sh;
+                        t.fade_w = 0;
+                        t.fade_h = 0;
+                    } else {
+                        t.width = sw;
+                        t.height = sh;
+                        t.overlap_w = horiz && i > 0 ? ol : 0;
+                        t.overlap_h = (!horiz && i > 0) ? ol : 0;
+                        t.fade_w = horiz && i > 0 ? Math.min(fade, t.overlap_w) : 0;
+                        t.fade_h = (!horiz && i > 0) ? Math.min(fade, t.overlap_h) : 0;
+                    }
+                });
+            }
+
             // ── Property panel rendering ──
             function renderPanel() {
                 panel.innerHTML = "";
@@ -1357,6 +1411,7 @@ canvas.addEventListener("pointerup", (e) => {
                 _composeDropdownEls.length = 0;
                 _refArea = null;
                 ensureTiles();
+                applyDrivenGeometryPreview();
 
                 // Compose view: right panel shows the compose setup instead of
                 // the per-tile parameters (toolbar Compose button toggles).
@@ -1507,6 +1562,12 @@ canvas.addEventListener("pointerup", (e) => {
                 panel.appendChild(Object.assign(document.createElement("hr"), { className: "mmh3te-sep" }));
 
                 // ── Dimensions (collapsible) ──
+                if (geometryDriven()) {
+                    const note = document.createElement("div");
+                    note.style.cssText = "font:11px sans-serif;color:#8ab;padding:6px 2px;";
+                    note.textContent = "Dimensions driven by source_width / source_height (geometry_mode).";
+                    panel.appendChild(note);
+                } else
                 makeDrawer(uistr("Dimensions"), true, (body) => {
                     if (cp === "horizontal_alternating") {
                         const hint = document.createElement("div");
@@ -1548,6 +1609,14 @@ canvas.addEventListener("pointerup", (e) => {
                 panel.appendChild(Object.assign(document.createElement("hr"), { className: "mmh3te-sep" }));
 
                 // ── Overlap / Fade (collapsible) ──
+                if (geometryDriven()) {
+                    const note = document.createElement("div");
+                    note.style.cssText = "font:11px sans-serif;color:#8ab;padding:6px 2px;";
+                    const ol = widgetVal("overlap_percent");
+                    const fd = widgetVal("fade_percent");
+                    note.textContent = `Overlap / Fade driven by percents (${ol} / ${fd}).`;
+                    panel.appendChild(note);
+                } else
                 makeDrawer(uistr("Overlap / Fade"), false, (body) => {
                     function addOverlapRow(label, prop, globalVal, disabled) {
                         const row = document.createElement("div");
@@ -1606,6 +1675,12 @@ canvas.addEventListener("pointerup", (e) => {
                 const tileMode = tile.cond_mode || "FL2VA";
                 const refDrawerTitle = tileMode === "FL2VA"
                     ? uistr("First/Last Images") : uistr("Reference Images");
+                if (refsDriven() && tileMode === "Ref2VA") {
+                    const note = document.createElement("div");
+                    note.style.cssText = "font:11px sans-serif;color:#8ab;padding:6px 2px;";
+                    note.textContent = "Reference stills/videos/audio come from the references input (Media Loader).";
+                    panel.appendChild(note);
+                } else {
                 // "Tile crop" source only exists while compose is on and at
                 // least one compose source image is set.
                 const composeAvailable = composeOnFlag();
@@ -1634,6 +1709,7 @@ canvas.addEventListener("pointerup", (e) => {
                     }
                     body.appendChild(refContainer);
                 }, null, "refs");
+                }
 
                 if (!tile.ref_images) tile.ref_images = [];
 

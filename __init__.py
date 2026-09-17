@@ -16,6 +16,7 @@ from .nodes import (
     MMH3SpatialExtendVideo,
     MMH3SpatialTileEditor,
     MMH3SpatialTileMedia,
+    MMH3SpatialLatentUpscaleSize,
     # MMH3MaskPreview,  # TEMPORARILY unregistered (debug helper, code kept)
     MMH3LastQuadrantPatch,
     MMH3LatentPreview,
@@ -30,6 +31,7 @@ NODE_CLASS_MAPPINGS = {
     "MMH3SpatialExtendVideo": MMH3SpatialExtendVideo,
     "MMH3SpatialTileEditor": MMH3SpatialTileEditor,
     "MMH3SpatialTileMedia": MMH3SpatialTileMedia,
+    "MMH3SpatialLatentUpscaleSize": MMH3SpatialLatentUpscaleSize,
     # "MMH3MaskPreview": MMH3MaskPreview,
     "MMH3LastQuadrantPatch": MMH3LastQuadrantPatch,
     "MMH3LatentPreview": MMH3LatentPreview,
@@ -47,6 +49,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MMH3SpatialExtendVideo": "MMH3 Spatial Extend Video",
     "MMH3SpatialTileEditor": "MMH3 Spatial Tile Editor",
     "MMH3SpatialTileMedia": "MMH3 Spatial Tile Media",
+    "MMH3SpatialLatentUpscaleSize": "MMH3 Spatial Latent Upscale Size",
     # "MMH3MaskPreview": "MMH3 Mask Preview",
     "MMH3LastQuadrantPatch": "MMH3 Last Quadrant Patch",
     "MMH3LatentPreview": "MMH3 Latent Preview (approx)",

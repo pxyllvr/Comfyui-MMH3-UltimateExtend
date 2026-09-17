@@ -597,6 +597,11 @@ def _merge(sample_params, noise, negative_list,
         finally:
             if cleanup is not None:
                 cleanup()
+        try:
+            import comfy.model_management as model_management
+            model_management.soft_empty_cache()
+        except Exception:
+            pass
         tile_v = out.tensors[0]
         if i == 0:
             out_a = out.tensors[1]

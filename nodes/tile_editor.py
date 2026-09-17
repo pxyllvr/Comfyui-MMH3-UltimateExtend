@@ -56,6 +56,117 @@ DEFAULT_FADE_W = 32
 DEFAULT_FADE_H = 32
 
 
+def _snap32(v, minimum=32):
+    v = int(round(float(v)))
+    v = max(minimum, v)
+    return max(minimum, int(round(v / CANVAS_MULTIPLE) * CANVAS_MULTIPLE))
+
+
+def _image_hw(source_image):
+    """Best-effort H,W from a Comfy IMAGE tensor (BHWC, HWC, or BWHC-like)."""
+    if source_image is None or not hasattr(source_image, "shape"):
+        return 0, 0
+    shape = tuple(int(s) for s in source_image.shape)
+    if len(shape) == 4:
+        # [B,H,W,C] (standard) or rarely [B,C,H,W]
+        if shape[-1] in (1, 3, 4) and shape[1] >= 32 and shape[2] >= 32:
+            return shape[2], shape[1]  # W, H
+        if shape[1] in (1, 3, 4) and shape[2] >= 32 and shape[3] >= 32:
+            return shape[3], shape[2]
+        return shape[2], shape[1]
+    if len(shape) == 3:
+        if shape[-1] in (1, 3, 4):
+            return shape[1], shape[0]
+        return shape[2], shape[1]
+    return 0, 0
+
+
+def _source_hw(source_width, source_height, source_image):
+    w = int(source_width or 0)
+    h = int(source_height or 0)
+    iw, ih = _image_hw(source_image)
+    # Prefer the actual frame when an image is wired — widgets of 0 are common
+    # in saved graphs and must not block driven geometry.
+    if iw >= 32 and ih >= 32:
+        if w < 32:
+            w = iw
+        if h < 32:
+            h = ih
+    return w, h
+
+
+def _apply_driven_geometry(tiles, scheme, axis, src_w, src_h,
+                           geometry_mode, overlap_percent, fade_percent):
+    """Override per-tile W/H/overlap/fade from a source frame size.
+
+    geometry_mode:
+      source_is_tile — each tile is the source frame (snapped). Canvas grows
+        along the plan axis: 2 horizontal tiles ≈ 2*W - overlap.
+      multiply_along_axis — canvas along the plan axis is N * source dim
+        (2 horizontal tiles → twice the width, same height). Tile size is
+        solved so placements cover that canvas including overlap.
+    """
+    if src_w < 32 or src_h < 32:
+        return tiles
+    # Keep the source pixel size exact so latent_tile_0 matches tile 0.
+    # Only snap when the incoming size is not already aligned.
+    if src_w % CANVAS_MULTIPLE:
+        src_w = _snap32(src_w)
+    if src_h % CANVAS_MULTIPLE:
+        src_h = _snap32(src_h)
+    n = len(tiles)
+    ol_pct = max(0.0, min(0.45, float(overlap_percent)))
+    fade_pct = max(0.0, min(1.0, float(fade_percent)))
+
+    if axis == "vertical":
+        overlap_main = _snap32(src_h * ol_pct, minimum=0) if ol_pct > 0 else 0
+        if overlap_main >= src_h:
+            overlap_main = max(0, src_h - CANVAS_MULTIPLE)
+        fade_main = _snap32(overlap_main * fade_pct, minimum=0) if overlap_main else 0
+        for i, t in enumerate(tiles):
+            t["width"] = src_w
+            if geometry_mode == "multiply_along_axis" and i > 0:
+                t["height"] = src_h * 2
+                t["overlap_h"] = src_h
+            else:
+                t["height"] = src_h
+                t["overlap_h"] = 0 if i == 0 else overlap_main
+            t["overlap_w"] = 0
+            t["fade_w"] = 0
+            t["fade_h"] = 0 if i == 0 else (
+                0 if geometry_mode == "multiply_along_axis"
+                else min(fade_main, t["overlap_h"]))
+    else:
+        overlap_main = _snap32(src_w * ol_pct, minimum=0) if ol_pct > 0 else 0
+        if overlap_main >= src_w:
+            overlap_main = max(0, src_w - CANVAS_MULTIPLE)
+        fade_main = _snap32(overlap_main * fade_pct, minimum=0) if overlap_main else 0
+        for i, t in enumerate(tiles):
+            t["height"] = src_h
+            t["overlap_h"] = 0
+            t["fade_h"] = 0
+            if scheme == "4_quadrants_expand":
+                t["width"] = src_w
+                t["overlap_w"] = 0 if i == 0 else overlap_main
+                t["fade_w"] = 0 if i == 0 else min(fade_main, t["overlap_w"])
+            elif geometry_mode == "multiply_along_axis" and i > 0:
+                # Original outpaint subject-switch layout:
+                # tile 0 = source, tile 1 = 2W x H with overlap = W.
+                # Frozen left half of tile 1 is the control; right half generates.
+                t["width"] = src_w * 2
+                t["overlap_w"] = src_w
+                t["fade_w"] = 0
+            else:
+                t["width"] = src_w
+                t["overlap_w"] = 0 if i == 0 else overlap_main
+                t["fade_w"] = 0 if i == 0 else min(fade_main, t["overlap_w"])
+    print(
+        f"[MMH3SpatialTileEditor] geometry {geometry_mode} source={src_w}x{src_h} "
+        f"tiles={[ (t['width'], t['height'], t['overlap_w'], t['overlap_h']) for t in tiles ]}"
+    )
+    return tiles
+
+
 # ---------------------------------------------------------------------------
 # Layout geometry helpers
 # ---------------------------------------------------------------------------
@@ -251,6 +362,20 @@ class MMH3SpatialTileEditor(io.ComfyNode):
                                 tooltip="Internal JSON managed by the dock editor."),
                 H3_REFS.Input("references", optional=True,
                               tooltip="Fantastic H3 Media Loader / Prompt Builder bundle. Passed through on the references output and stored on tile_config['h3_refs'] for Spatial Extend."),
+                io.Int.Input("source_width", default=0, min=0, max=8192, step=32,
+                             tooltip="Source frame width in pixels. 0 = use the dock Dimensions. Drive this from Get Image Size so the input is scaled into a tile instead of cropped."),
+                io.Int.Input("source_height", default=0, min=0, max=8192, step=32,
+                             tooltip="Source frame height in pixels. 0 = use the dock Dimensions."),
+                io.Image.Input("source_image", optional=True,
+                               tooltip="Optional. If source_width/height are 0, W/H are read from this IMAGE (first frame of a Load Video / Load Image)."),
+                io.Combo.Input("geometry_mode",
+                               options=["manual", "source_is_tile", "multiply_along_axis"],
+                               default="multiply_along_axis",
+                               tooltip="manual: dock Dimensions/Overlap win. source_is_tile: every tile is the source size. multiply_along_axis: 2-panel outpaint — tile 0 = source WxH, tile 1 = 2W×H with overlap W, canvas 2W×H. Connect GetImageSize to source_width/height so the dock preview matches."),
+                io.Float.Input("overlap_percent", default=0.125, min=0.0, max=0.45, step=0.005,
+                               tooltip="When geometry is driven, overlap is this fraction of the source size along the plan axis (0.125 ≈ 128px on a 1024 tile). Ignored in manual mode."),
+                io.Float.Input("fade_percent", default=0.25, min=0.0, max=1.0, step=0.05,
+                               tooltip="Fade band as a fraction of the computed overlap. Ignored in manual mode."),
             ],
             outputs=[
                 io.Dict.Output("tile_config",
@@ -259,13 +384,20 @@ class MMH3SpatialTileEditor(io.ComfyNode):
                                tooltip="Inspectable geometry summary: tile count, plan, dimensions, and per-tile compose crop boxes."),
                 H3_REFS.Output("references",
                                tooltip="Passthrough of the incoming Fantastic H3 references bundle (empty bundle if none wired)."),
+                io.Int.Output("width",
+                              tooltip="Canvas width in pixels (all tiles after overlap). Feed this to a latent upscaler target width."),
+                io.Int.Output("height",
+                              tooltip="Canvas height in pixels. Feed this to a latent upscaler target height."),
             ],
         )
 
     @classmethod
     def execute(cls, show_editor=True,
                 base_prompt="", base_negative="",
-                tile_data="{}", references=None) -> io.NodeOutput:
+                tile_data="{}", references=None,
+                source_width=0, source_height=0, source_image=None,
+                geometry_mode="multiply_along_axis",
+                overlap_percent=0.125, fade_percent=0.25) -> io.NodeOutput:
         raw = {}
         if tile_data:
             try:
@@ -342,6 +474,12 @@ class MMH3SpatialTileEditor(io.ComfyNode):
                 "fade_h": t.get("fade_h", DEFAULT_FADE_H),
             })
 
+        src_w, src_h = _source_hw(source_width, source_height, source_image)
+        if geometry_mode != "manual" and src_w >= 32 and src_h >= 32:
+            _apply_driven_geometry(
+                tiles, scheme, axis, src_w, src_h,
+                geometry_mode, overlap_percent, fade_percent)
+
         _validate_tiles(tiles, scheme, axis)
 
         total_w, total_h = _total_size(tiles, scheme, axis)
@@ -388,7 +526,7 @@ class MMH3SpatialTileEditor(io.ComfyNode):
                 "compose_crops": t["compose_crops"],
             } for t in tiles],
         }
-        return io.NodeOutput(config, segments, refs)
+        return io.NodeOutput(config, segments, refs, int(total_w), int(total_h))
 
 
 def align_frame_count(n):
