@@ -74,6 +74,9 @@ const ZH_UI = {
     "(no image)": "（无图像）",
     "File not found in input folder": "输入文件夹中未找到该文件",
     "+ Add Image": "+ 添加图像",
+    "Load files…": "加载文件…",
+    "Drop images here": "将图像拖到此处",
+    "Search images…": "搜索图像…",
     "Remove image": "移除图像",
     // Compose panel
     "Active: tiles whose Source is 'Tile crop' use their region of the images below.": "已启用：来源为“分块裁剪区”的分块使用下方图像中各自的区域。",
@@ -223,7 +226,30 @@ function invalidateInputImages() { _inputImages = null; }
 
 function imageUrl(filename) {
     if (!filename) return "";
-    return `/view?filename=${encodeURIComponent(filename)}&type=input&preview=webp;80`;
+    const parts = String(filename).replace(/\\/g, "/").split("/");
+    const name = parts.pop();
+    const sub = parts.join("/");
+    // jpeg, not webp: /view?preview=webp hits Pillow VP8 partition0 overflow
+    // (encoding error 6) on large camera stills.
+    let url = `/view?filename=${encodeURIComponent(name)}&type=input&preview=jpeg;70`;
+    if (sub) url += `&subfolder=${encodeURIComponent(sub)}`;
+    return url;
+}
+
+async function uploadInputImage(file) {
+    const body = new FormData();
+    body.append("image", file);
+    body.append("overwrite", "true");
+    body.append("type", "input");
+    const resp = await fetch("/upload/image", { method: "POST", body });
+    if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        throw new Error(text || `upload failed (${resp.status})`);
+    }
+    const data = await resp.json();
+    const name = data.name || file.name;
+    const sub = data.subfolder || "";
+    return sub ? `${sub.replace(/\\/g, "/")}/${name}` : name;
 }
 
 // ── Serialization helpers ──
@@ -359,8 +385,13 @@ function injectStyle() {
         .mmh3te-ref-trigger .arrow { color:#888; font:10px sans-serif; }
         .mmh3te-ref-dropdown { position:fixed; z-index:10000;
             background:#1d1d1d; border:1px solid #444; border-radius:4px;
-            display:none; max-height:300px; overflow-y:auto; min-width:240px; }
+            display:none; max-height:360px; overflow-y:auto; min-width:240px; }
         .mmh3te-ref-dropdown.open { display:block; }
+        .mmh3te-ref-search { position:sticky; top:0; z-index:1; width:calc(100% - 12px);
+            margin:4px 6px; box-sizing:border-box; background:#111; color:#ddd;
+            border:1px solid #444; border-radius:3px; padding:4px 6px; font:11px sans-serif; }
+        .mmh3te-drop { outline:2px dashed #46b4e6; outline-offset:-4px; }
+        .mmh3te-drop-hint { font:11px sans-serif; color:#888; padding:6px 2px; }
         .mmh3te-ref-opt { display:flex; align-items:center; gap:6px; padding:4px 6px;
             cursor:pointer; border-bottom:1px solid #333; }
         .mmh3te-ref-opt:hover { background:#2a3a42; }
@@ -588,6 +619,22 @@ app.registerExtension({
             const dock = document.createElement("div");
             dock.className = "mmh3te-dock";
             node._mmh3teDock = dock;
+            dock.addEventListener("dragover", (e) => {
+                if (![...e.dataTransfer.types].includes("Files")) return;
+                e.preventDefault();
+                dock.classList.add("mmh3te-drop");
+            });
+            dock.addEventListener("dragleave", (e) => {
+                if (e.target === dock) dock.classList.remove("mmh3te-drop");
+            });
+            dock.addEventListener("drop", async (e) => {
+                if (![...e.dataTransfer.types].includes("Files")) return;
+                e.preventDefault();
+                dock.classList.remove("mmh3te-drop");
+                if (typeof node._mmh3teIngestRefs === "function") {
+                    await node._mmh3teIngestRefs(e.dataTransfer.files);
+                }
+            });
 
             // Head
             const head = document.createElement("div");
@@ -1590,6 +1637,32 @@ canvas.addEventListener("pointerup", (e) => {
 
                 if (!tile.ref_images) tile.ref_images = [];
 
+                async function ingestRefFiles(fileList) {
+                    const mode = tile.cond_mode || "FL2VA";
+                    const maxRefs = mode === "FL2VA" ? 2 : 10;
+                    const incoming = Array.from(fileList || []).filter((f) => f && f.type && f.type.startsWith("image/"));
+                    if (!incoming.length) return;
+                    if (tile.ref_source === "crop") tile.ref_source = "own";
+                    for (const file of incoming) {
+                        if (tile.ref_images.length >= maxRefs) break;
+                        try {
+                            const stored = await uploadInputImage(file);
+                            const empty = tile.ref_images.findIndex((n) => !n);
+                            if (empty >= 0) tile.ref_images[empty] = stored;
+                            else tile.ref_images.push(stored);
+                        } catch (err) {
+                            console.error(TAG, "upload failed", file?.name, err);
+                        }
+                    }
+                    invalidateInputImages();
+                    window._mmh3teInputImages = await fetchInputImages();
+                    serialize();
+                    drawCanvas();
+                    rebuildRefList();
+                    if (node._composeView) renderPanel();
+                }
+                node._mmh3teIngestRefs = ingestRefFiles;
+
                 function rebuildRefList() {
                     refContainer.innerHTML = "";
                     // Reset stale body-level dropdowns and point the shared
@@ -1681,10 +1754,25 @@ canvas.addEventListener("pointerup", (e) => {
                         });
                         dropdown.appendChild(noneOpt);
 
+                        const search = document.createElement("input");
+                        search.type = "search";
+                        search.className = "mmh3te-ref-search";
+                        search.placeholder = uistr("Search images…");
+                        search.addEventListener("click", (e) => e.stopPropagation());
+                        search.addEventListener("input", () => {
+                            const q = search.value.trim().toLowerCase();
+                            dropdown.querySelectorAll(".mmh3te-ref-opt[data-file]").forEach((el) => {
+                                const name = (el.dataset.file || "").toLowerCase();
+                                el.style.display = (!q || name.includes(q)) ? "" : "none";
+                            });
+                        });
+                        dropdown.appendChild(search);
+
                         // Image options
                         for (const file of allImages) {
                             const opt = document.createElement("div");
                             opt.className = "mmh3te-ref-opt" + (file === curFile ? " selected" : "");
+                            opt.dataset.file = file;
                             const oImg = document.createElement("img");
                             oImg.src = imageUrl(file);
                             opt.appendChild(oImg);
@@ -1749,7 +1837,7 @@ canvas.addEventListener("pointerup", (e) => {
                         refContainer.appendChild(row);
                     }
 
-                    // Add button
+                    // Add / load buttons
                     if (images.length < maxRefs) {
                         const addBtn = document.createElement("button");
                         addBtn.className = "mmh3te-addbtn";
@@ -1762,6 +1850,27 @@ canvas.addEventListener("pointerup", (e) => {
                             if (node._composeView) renderPanel();
                         });
                         refContainer.appendChild(addBtn);
+
+                        const loadBtn = document.createElement("button");
+                        loadBtn.className = "mmh3te-addbtn";
+                        loadBtn.textContent = uistr("Load files…");
+                        loadBtn.title = uistr("Drop images here");
+                        loadBtn.addEventListener("click", () => {
+                            const input = document.createElement("input");
+                            input.type = "file";
+                            input.accept = "image/png,image/jpeg,image/webp,image/bmp,image/gif";
+                            input.multiple = true;
+                            input.addEventListener("change", async () => {
+                                if (input.files?.length) await ingestRefFiles(input.files);
+                            });
+                            input.click();
+                        });
+                        refContainer.appendChild(loadBtn);
+
+                        const hint = document.createElement("div");
+                        hint.className = "mmh3te-drop-hint";
+                        hint.textContent = uistr("Drop images here");
+                        refContainer.appendChild(hint);
                     }
 
                     // Outside-click closing is handled by the single shared
