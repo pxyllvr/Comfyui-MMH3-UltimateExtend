@@ -22,6 +22,31 @@ from comfy_api.latest import io
 VAE_DOWNSAMPLE = 16
 CANVAS_MULTIPLE = 32
 
+# Fantastic MiniMax H3 Media Loader / Prompt Builder bundle.
+H3_REFS = io.Custom("H3_REFS")
+
+
+def _empty_h3_refs():
+    return {
+        "pictures": [],
+        "videos": [],
+        "video_audios": [],
+        "audios": [],
+        "items": [],
+    }
+
+
+def _normalize_h3_refs(references):
+    if not isinstance(references, dict):
+        return _empty_h3_refs()
+    return {
+        "pictures": list(references.get("pictures") or []),
+        "videos": list(references.get("videos") or []),
+        "video_audios": list(references.get("video_audios") or []),
+        "audios": list(references.get("audios") or []),
+        "items": list(references.get("items") or []),
+    }
+
 # Defaults for new tiles (used by JS when creating tiles)
 DEFAULT_TILE_WIDTH = 512
 DEFAULT_TILE_HEIGHT = 768
@@ -205,9 +230,12 @@ class MMH3SpatialTileEditor(io.ComfyNode):
                 "overlap/fade values. No images are loaded or tensors emitted. "
                 "Compose supplies a whole image that is split by the tile plan; "
                 "each tile may use its split crop (as FL2VA first/last frames "
-                "or Ref2VA reference blocks) or load its own images. The JS "
-                "ships each tile's exact crop box as plain numbers "
-                "(compose_crops). Connect tile_config to MMH3 Spatial Extend Video."
+                "or Ref2VA reference blocks) or load its own images. Optional "
+                "'references' is the Fantastic H3 Media Loader / Prompt Builder "
+                "H3_REFS bundle: passed through unchanged (so upscale graphs keep "
+                "their Picture-tag previews) and also stored on tile_config for "
+                "Spatial Extend / Tile Media. Connect tile_config to MMH3 Spatial "
+                "Extend Video or MMH3 Spatial Tile Media."
             ),
             search_aliases=["h3 tile editor", "h3 tile config", "h3 extend editor"],
             inputs=[
@@ -221,19 +249,23 @@ class MMH3SpatialTileEditor(io.ComfyNode):
                                 tooltip="Shared negative prompt applied to all tiles."),
                 io.String.Input("tile_data", default="{}",
                                 tooltip="Internal JSON managed by the dock editor."),
+                H3_REFS.Input("references", optional=True,
+                              tooltip="Fantastic H3 Media Loader / Prompt Builder bundle. Passed through on the references output and stored on tile_config['h3_refs'] for Spatial Extend."),
             ],
             outputs=[
                 io.Dict.Output("tile_config",
-                               tooltip="Complete tile configuration (pure dict/text) for MMH3 Spatial Extend Video."),
+                               tooltip="Complete tile configuration for MMH3 Spatial Extend Video / Tile Media."),
                 io.Dict.Output("segments_info",
                                tooltip="Inspectable geometry summary: tile count, plan, dimensions, and per-tile compose crop boxes."),
+                H3_REFS.Output("references",
+                               tooltip="Passthrough of the incoming Fantastic H3 references bundle (empty bundle if none wired)."),
             ],
         )
 
     @classmethod
     def execute(cls, show_editor=True,
                 base_prompt="", base_negative="",
-                tile_data="{}") -> io.NodeOutput:
+                tile_data="{}", references=None) -> io.NodeOutput:
         raw = {}
         if tile_data:
             try:
@@ -321,6 +353,7 @@ class MMH3SpatialTileEditor(io.ComfyNode):
         # ever absent (async decode races) -- no layout re-derivation needed.
         for i, t in enumerate(tiles):
             t["placement"] = list(placements[i])
+        refs = _normalize_h3_refs(references)
         config = {
             "scheme": scheme,
             "axis": axis,
@@ -330,6 +363,7 @@ class MMH3SpatialTileEditor(io.ComfyNode):
             "total_width": total_w,
             "total_height": total_h,
             "tiles": tiles,
+            "h3_refs": refs,
         }
 
         segments = {
@@ -354,7 +388,7 @@ class MMH3SpatialTileEditor(io.ComfyNode):
                 "compose_crops": t["compose_crops"],
             } for t in tiles],
         }
-        return io.NodeOutput(config, segments)
+        return io.NodeOutput(config, segments, refs)
 
 
 def align_frame_count(n):

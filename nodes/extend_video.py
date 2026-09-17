@@ -424,7 +424,8 @@ def _merge(sample_params, noise, negative_list,
            ol_ws, ol_hs, fws, fhs, overlap_mode, overlap_blend, inpaint=None,
            skip_first=False, masked_area_noise=0.0,
            fade_mode="flat", fade_val=0.5,
-           params_2nd=None, fade_params=None, second_pass_mode="unmasked"):
+           params_2nd=None, fade_params=None, second_pass_mode="unmasked",
+           fun_ctl=None):
     """Sample every tile and stitch them into one AV latent per a tile_plan.
 
     `tconds` / `negative_list` / `latents` are lists aligned to plan placements
@@ -590,7 +591,8 @@ def _merge(sample_params, noise, negative_list,
             bias = None
             if qsample and m_noise is not None and bool((m_noise < 1.0).any()):
                 bias = (lambda nz: _InitBiasNoise2D(nz, m_noise, tile, csign))
-            out = _run_params(piece, cond, negative, noise, sample_params,
+            out = _run_params(piece, cond, negative, noise,
+                              _params_for_tile(sample_params, i, fun_ctl),
                               f"tile {i}", bias=bias)
         finally:
             if cleanup is not None:
@@ -787,7 +789,8 @@ def _merge_2d(sample_params, noise, negative_list,
               skip_first=False, masked_area_noise=0.0,
               bug_patch=None,
               fade_mode="flat", fade_val=0.5,
-              params_2nd=None, fade_params=None, second_pass_mode="unmasked"):
+              params_2nd=None, fade_params=None, second_pass_mode="unmasked",
+              fun_ctl=None):
     """Sample the 5 tiles of '4_quadrants_expand' and stitch them into one AV
     latent. Tile 0 is the center anchor; tiles 1..4 are sampled around it and
     blended over the rectangles where they overlap already-placed content (the
@@ -1001,7 +1004,8 @@ def _merge_2d(sample_params, noise, negative_list,
                 bias = None
                 if qsample and m_noise is not None and bool((m_noise < 1.0).any()):
                     bias = (lambda nz: _InitBiasNoise2D(nz, m_noise, tile, csign))
-                out = _run_params(piece, cond, negative, noise, sample_params,
+                out = _run_params(piece, cond, negative, noise,
+                                  _params_for_tile(sample_params, i, fun_ctl),
                                   f"quadrant tile {i}", bias=bias)
             finally:
                 if cleanup is not None:
@@ -1301,7 +1305,9 @@ class MMH3SpatialExtendVideo(io.ComfyNode):
                 io.Clip.Input("clip",
                     tooltip="MiniMax H3 CLIP model for encoding prompts and reference images."),
                 io.Vae.Input("vae",
-                    tooltip="MiniMax H3 Video VAE for encoding reference images."),
+                    tooltip="MiniMax H3 Video VAE for encoding reference images and reference videos."),
+                io.Vae.Input("audio_vae", optional=True,
+                    tooltip="MiniMax H3 Audio VAE. Required to encode wired reference audio / video soundtracks from MMH3 Spatial Tile Media. Without it, audio refs only hit the text encoder."),
                 io.Noise.Input("noise", tooltip="Noise source; one noise tensor is generated per tile."),
                 io.Dict.Input("tile_config",
                     tooltip="Output of 'MMH3 Spatial Tile Editor'. Provides per-tile prompts, reference images, dimensions, overlap/fade, and layout scheme."),
@@ -1333,6 +1339,16 @@ class MMH3SpatialExtendVideo(io.ComfyNode):
                     tooltip="Existing anchor video latent. When connected, the first tile is NOT sampled - its video/audio are taken straight from this latent as an already-generated anchor and the remaining tiles are extended around it. When unconnected, tile 0 (and all tiles) are sampled normally."),
                 io.Dict.Input("bug_patch", optional=True,
                               tooltip="Layout-specific special handling. Currently: output of 'MMH3 Last Quadrant Patch' (4_quadrants_expand only) replaces the noise mask of any tile enabled on that node (four per-tile toggles) with explicit center-seam/edge-seam frozen+fade widths. Ignored (console note) on other layouts. Leave unconnected for default behavior."),
+                io.ControlNet.Input("fun_control_net", optional=True,
+                    tooltip="Optional MiniMax H3 Fun ControlNet (from ModelPatchLoader / Fun ControlNet loader). Applied to the HIGH (and LOW, if present) sample-params models. Control frames come from fun_control_video or tile_config.fun_control_video."),
+                io.Image.Input("fun_control_video", optional=True,
+                    tooltip="Optional preprocessed control video (pose/depth/canny/…). Overrides tile_config.fun_control_video from MMH3 Spatial Tile Media."),
+                io.Float.Input("fun_control_strength", default=1.0, min=0.0, max=10.0, step=0.01,
+                    tooltip="Fun ControlNet strength. Ignored when fun_control_net is unconnected."),
+                io.Float.Input("fun_control_start", default=0.0, min=0.0, max=1.0, step=0.001,
+                    tooltip="Fun ControlNet start percent."),
+                io.Float.Input("fun_control_end", default=1.0, min=0.0, max=1.0, step=0.001,
+                    tooltip="Fun ControlNet end percent."),
             ],
             outputs=[
                 io.Latent.Output("latent", tooltip="The tiles merged into one MiniMax H3 AV latent. The audio channel is tile 0's generated audio."),
@@ -1350,7 +1366,14 @@ class MMH3SpatialExtendVideo(io.ComfyNode):
                 fade_impl="mask", init_content_weight=1.0,
                 ref_mode="use_ref_image",
                 overlap_mode="earlier", overlap_blend="linear",
-                second_pass_mode="unmasked", **kwargs) -> io.NodeOutput:
+                second_pass_mode="unmasked",
+                audio_vae=None,
+                fun_control_net=None,
+                fun_control_video=None,
+                fun_control_strength=1.0,
+                fun_control_start=0.0,
+                fun_control_end=1.0,
+                **kwargs) -> io.NodeOutput:
         # The socket is named '2nd_sample_params' (not a valid Python
         # identifier), so ComfyUI passes it through **kwargs.
         second_sample_params = kwargs.get("2nd_sample_params")
@@ -1370,6 +1393,12 @@ class MMH3SpatialExtendVideo(io.ComfyNode):
             init_content_weight=init_content_weight,
             ref_mode=ref_mode,
             overlap_mode=overlap_mode, overlap_blend=overlap_blend,
+            audio_vae=audio_vae,
+            fun_control_net=fun_control_net,
+            fun_control_video=fun_control_video,
+            fun_control_strength=fun_control_strength,
+            fun_control_start=fun_control_start,
+            fun_control_end=fun_control_end,
         )
 
     # ── tile_config path: create per-tile conditionings from config dict ──
@@ -1483,6 +1512,38 @@ class MMH3SpatialExtendVideo(io.ComfyNode):
                 f"{', '.join(unique)}"
             )
 
+        wired = tile_config.get("wired_media") or {}
+        wired_images = list(wired.get("images") or [])
+        wired_videos = list(wired.get("videos") or [])
+        wired_video_audios = list(wired.get("video_audios") or [])
+        wired_audios = list(wired.get("audios") or [])
+        hrefs = tile_config.get("h3_refs") or {}
+        if not wired_images:
+            wired_images = [v for v in (hrefs.get("pictures") or []) if v is not None]
+        if not wired_videos:
+            wired_videos = [v for v in (hrefs.get("videos") or []) if v is not None]
+            wired_video_audios = list(hrefs.get("video_audios") or [])
+        if not wired_audios:
+            wired_audios = [v for v in (hrefs.get("audios") or []) if v is not None]
+        wired_mode = wired.get("apply_mode") or "append_ref2va"
+        wired_idx = int(wired.get("tile_index", 1))
+        audio_vae = kwargs.get("audio_vae")
+
+        def _tile_gets_wired(i, tile):
+            if not (wired_images or wired_videos or wired_audios):
+                return False
+            if wired_mode == "selected_tile":
+                return i == wired_idx
+            return tile.get("cond_mode", "FL2VA") == "Ref2VA"
+
+        if wired_images or wired_videos or wired_audios:
+            targets = [i for i, t in enumerate(tiles_cfg) if _tile_gets_wired(i, t)]
+            print(f"[MMH3SpatialExtendVideo] wired media: {len(wired_images)} still(s), "
+                  f"{len(wired_videos)} video(s), {len(wired_audios)} audio(s) -> tiles {targets} "
+                  f"({wired_mode})")
+
+        kwargs["fun_ctl"] = _build_fun_ctl(sample_params, vae, kwargs, tile_config)
+
         # ── Phase 2: Create all conditionings (with cache dedup) ──
         # use_overlap defers tiles 1..n-1: their <Picture 1> is the overlap
         # strip sliced from tile 0's latent, which only exists after tile 0 is
@@ -1504,7 +1565,20 @@ class MMH3SpatialExtendVideo(io.ComfyNode):
             # first/last frames; Ref2VA tiles treat every ref as a reference
             # block. Tiles can mix freely within one plan.
             tile_mode = tile.get("cond_mode", "FL2VA")
-            refs = all_refs[i]
+            refs = list(all_refs[i])
+            extra_videos, extra_audios = [], []
+            if _tile_gets_wired(i, tile):
+                if wired_mode == "replace_ref2va" and tile_mode == "Ref2VA":
+                    refs = list(wired_images)
+                else:
+                    refs = refs + list(wired_images)
+                extra_videos = [
+                    {"frames": fr, "audio": (wired_video_audios[k] if k < len(wired_video_audios) else None)}
+                    for k, fr in enumerate(wired_videos)
+                ]
+                extra_audios = list(wired_audios)
+                if extra_videos or extra_audios:
+                    tile_mode = "Ref2VA"
             # Compose refs are per-tile in-memory image tensors (from either
             # front-end compose_crops boxes or legacy compose_frames), so they
             # are unhashable; key by tile index + ref count instead.
@@ -1514,14 +1588,17 @@ class MMH3SpatialExtendVideo(io.ComfyNode):
                 ref_names = tuple(f"compose:{i}:{k}" for k in range(len(refs)))
             else:
                 ref_names = tuple(tile.get("ref_images", []))
-            cache_key = (full_prompt, full_neg, ref_names, w, h, tile_mode, frame_count)
+            cache_key = (full_prompt, full_neg, ref_names, w, h, tile_mode,
+                         frame_count, wired_mode, i if extra_videos or extra_audios else -1)
 
             if cache_key in cond_cache:
                 pos_cond, neg_cond = cond_cache[cache_key]
             else:
                 pos_cond = _create_conditioning(
                     clip, vae, full_prompt, w, h, frame_count, refs,
-                    tile_mode, ref_image_size)
+                    tile_mode, ref_image_size,
+                    extra_videos=extra_videos, extra_audios=extra_audios,
+                    audio_vae=audio_vae)
                 neg_cond = None
                 if full_neg:
                     neg_cond = _create_conditioning(
@@ -1701,6 +1778,7 @@ class MMH3SpatialExtendVideo(io.ComfyNode):
                 fade_params={"fade_impl": kwargs.get("fade_impl", "mask"),
                              "init_content_weight": float(kwargs.get("init_content_weight", 1.0))},
                 second_pass_mode=kwargs.get("second_pass_mode", "unmasked"),
+                fun_ctl=kwargs.get("fun_ctl"),
             )
         else:
             out_v, out_a, tiles_info, t0 = _merge(
@@ -1716,6 +1794,7 @@ class MMH3SpatialExtendVideo(io.ComfyNode):
                 fade_params={"fade_impl": kwargs.get("fade_impl", "mask"),
                              "init_content_weight": float(kwargs.get("init_content_weight", 1.0))},
                 second_pass_mode=kwargs.get("second_pass_mode", "unmasked"),
+                fun_ctl=kwargs.get("fun_ctl"),
             )
 
         out = {"samples": comfy.nested_tensor.NestedTensor((out_v, out_a))}
@@ -1888,27 +1967,20 @@ def _sample_anchor_tile(sample_params, noise, negative, cond,
 
 
 def _create_conditioning(clip, vae, prompt, w, h, frame_count, ref_images,
-                         cond_mode, ref_image_size="match"):
+                         cond_mode, ref_image_size="match",
+                         extra_videos=None, extra_audios=None, audio_vae=None):
     """Create conditioning for a tile in the specified mode.
 
     cond_mode "FL2VA": ref_images[0] -> first_frame, ref_images[1] -> last_frame.
     cond_mode "Ref2VA": each ref_image becomes a reference block.
-    ref_image_size: "match" or "max" for Ref2VA resize strategy.
+    extra_videos / extra_audios are Ref2VA-only (from MMH3 Spatial Tile Media).
     """
-    import math
-    try:
-        from comfy_extras.nodes_minimax_h3 import (
-            _resize, _empty_av_latent, CANVAS_MULTIPLE, FPS,
-        )
-    except ImportError:
-        raise ImportError("tile_config conditioning requires comfy_extras/nodes_minimax_h3.py")
-
-    if cond_mode == "FL2VA":
+    if cond_mode == "FL2VA" and not (extra_videos or extra_audios):
         return _create_fl2va_conditioning(
             clip, vae, prompt, w, h, frame_count, ref_images)
-    else:
-        return _create_ref2va_conditioning(
-            clip, vae, prompt, w, h, frame_count, ref_images, ref_image_size)
+    return _create_ref2va_conditioning(
+        clip, vae, prompt, w, h, frame_count, ref_images, ref_image_size,
+        extra_videos=extra_videos, extra_audios=extra_audios, audio_vae=audio_vae)
 
 
 def _create_fl2va_conditioning(clip, vae, prompt, w, h, frame_count, ref_images):
@@ -1949,8 +2021,144 @@ def _create_fl2va_conditioning(clip, vae, prompt, w, h, frame_count, ref_images)
     return cond
 
 
+def _encode_ref_audio(audio_vae, audio):
+    """Match comfy_extras.nodes_minimax_h3._encode_ref_audio when present."""
+    try:
+        from comfy_extras.nodes_minimax_h3 import _encode_ref_audio as _core
+        return _core(audio_vae, audio)
+    except Exception:
+        pass
+    import torch
+    import torchaudio
+    waveform = audio["waveform"]
+    sr = audio["sample_rate"]
+    vae_sr = getattr(audio_vae, "audio_sample_rate", 32000)
+    if sr != vae_sr:
+        waveform = torchaudio.functional.resample(waveform, sr, vae_sr)
+    z = audio_vae.encode(waveform[:1].movedim(1, -1))
+    return z, int(z.shape[-1])
+
+
+def _build_fun_ctl(sample_params, vae, kwargs, tile_config):
+    control_net = kwargs.get("fun_control_net")
+    control_video = kwargs.get("fun_control_video")
+    if control_video is None:
+        control_video = tile_config.get("fun_control_video")
+    if control_net is None or control_video is None:
+        return None
+    strength = float(kwargs.get("fun_control_strength", 1.0) or 0.0)
+    if strength <= 0:
+        return None
+    fit = tile_config.get("fun_control_fit") or "canvas_crop"
+    tiles = tile_config.get("tiles") or []
+    placements = [t.get("placement") or [0, 0, t.get("width", 0), t.get("height", 0)]
+                  for t in tiles]
+    print(f"[MMH3SpatialExtendVideo] Fun ControlNet per-tile "
+          f"fit={fit} strength={strength} frames={tuple(control_video.shape)[:3]}")
+    return {
+        "net": control_net,
+        "video": control_video,
+        "vae": vae,
+        "strength": strength,
+        "start": float(kwargs.get("fun_control_start", 0.0) or 0.0),
+        "end": float(kwargs.get("fun_control_end", 1.0) or 1.0),
+        "fit": fit,
+        "placements": placements,
+        "total_w": int(tile_config.get("total_width") or 0),
+        "total_h": int(tile_config.get("total_height") or 0),
+        "apply_mode": (tile_config.get("wired_media") or {}).get("apply_mode"),
+        "tile_index": int((tile_config.get("wired_media") or {}).get("tile_index", -1)),
+    }
+
+
+def _crop_control_for_tile(video, tile_index, fun_ctl, tw, th):
+    """Return control frames sized to this tile, not the full canvas."""
+    try:
+        from comfy_extras.nodes_minimax_h3 import _resize
+    except ImportError:
+        import comfy.utils
+        def _resize(image, width, height, crop):
+            samples = image[..., :3].movedim(-1, 1)
+            samples = comfy.utils.common_upscale(samples, width, height, "lanczos", crop)
+            return samples.movedim(1, -1)
+
+    if video is None:
+        return None
+    fit = (fun_ctl or {}).get("fit") or "canvas_crop"
+    if fit != "canvas_crop":
+        return _resize(video, tw, th, "center")
+
+    placements = fun_ctl.get("placements") or []
+    if tile_index >= len(placements):
+        return _resize(video, tw, th, "center")
+    x, y, w, h = [int(v) for v in placements[tile_index][:4]]
+    total_w = max(1, int(fun_ctl.get("total_w") or video.shape[2]))
+    total_h = max(1, int(fun_ctl.get("total_h") or video.shape[1]))
+    vh, vw = int(video.shape[1]), int(video.shape[2])
+    sx = vw / float(total_w)
+    sy = vh / float(total_h)
+    x0 = max(0, min(vw - 1, int(round(x * sx))))
+    y0 = max(0, min(vh - 1, int(round(y * sy))))
+    x1 = max(x0 + 1, min(vw, int(round((x + w) * sx))))
+    y1 = max(y0 + 1, min(vh, int(round((y + h) * sy))))
+    crop = video[:, y0:y1, x0:x1, :]
+    print(f"[MMH3SpatialExtendVideo] Fun Control crop tile {tile_index}: "
+          f"src[{y0}:{y1},{x0}:{x1}] -> {tw}x{th}")
+    return _resize(crop, tw, th, "disabled")
+
+
+def _apply_fun_to_model(model, control_net, vae, frames, strength, start, end):
+    from comfy_extras.nodes_minimax_h3 import MiniMaxH3FunControlNetApply
+    try:
+        out = MiniMaxH3FunControlNetApply.execute(
+            model=model, model_patch=control_net, vae=vae,
+            strength=strength, start_percent=start, end_percent=end,
+            control_video=frames)
+    except TypeError:
+        out = MiniMaxH3FunControlNetApply.execute(
+            model=model, control_net=control_net, vae=vae,
+            strength=strength, start_percent=start, end_percent=end,
+            control_video=frames)
+    return out[0] if hasattr(out, "__getitem__") else out
+
+
+def _params_for_tile(sample_params, tile_index, fun_ctl):
+    if not fun_ctl:
+        return sample_params
+    apply_mode = fun_ctl.get("apply_mode")
+    only = fun_ctl.get("tile_index")
+    if apply_mode == "selected_tile" and only is not None and only >= 0 and tile_index != only:
+        return sample_params
+    video = fun_ctl.get("video")
+    if video is None:
+        return sample_params
+    # Infer tile pixel size from the control crop / placement.
+    placements = fun_ctl.get("placements") or []
+    if tile_index < len(placements):
+        tw, th = int(placements[tile_index][2]), int(placements[tile_index][3])
+    else:
+        tw, th = int(video.shape[2]), int(video.shape[1])
+    frames = _crop_control_for_tile(video, tile_index, fun_ctl, tw, th)
+    if frames is None:
+        return sample_params
+    patched = dict(sample_params)
+    for key in ("model_high", "model_low"):
+        model = patched.get(key)
+        if model is None:
+            continue
+        try:
+            patched[key] = _apply_fun_to_model(
+                model, fun_ctl["net"], fun_ctl["vae"], frames,
+                fun_ctl["strength"], fun_ctl["start"], fun_ctl["end"])
+        except Exception as exc:
+            print(f"[MMH3SpatialExtendVideo] Fun ControlNet tile {tile_index} "
+                  f"{key} failed: {exc}")
+    return patched
+
+
 def _create_ref2va_conditioning(clip, vae, prompt, w, h, frame_count, ref_images,
-                                ref_image_size="match", latent_refs=None):
+                                ref_image_size="match", latent_refs=None,
+                                extra_videos=None, extra_audios=None, audio_vae=None):
     """Create conditioning in Ref2VA (ReferenceToVideo) mode.
 
     Each image in ref_images becomes a reference block. Prompt should use
@@ -1998,6 +2206,72 @@ def _create_ref2va_conditioning(clip, vae, prompt, w, h, frame_count, ref_images
             "latent_h": th // 16, "latent_w": tw // 16,
             "latent": z,
         })
+
+    try:
+        from comfy_extras.nodes_minimax_h3 import adapt_canvas, FPS
+    except ImportError:
+        FPS = 24
+        def adapt_canvas(vw, vh):
+            return (
+                max(CANVAS_MULTIPLE, round(vw / CANVAS_MULTIPLE) * CANVAS_MULTIPLE),
+                max(CANVAS_MULTIPLE, round(vh / CANVAS_MULTIPLE) * CANVAS_MULTIPLE),
+            )
+
+    for spec in extra_videos or ():
+        frames = spec.get("frames") if isinstance(spec, dict) else spec
+        soundtrack = spec.get("audio") if isinstance(spec, dict) else None
+        if frames is None or not hasattr(frames, "shape") or frames.shape[0] < 5:
+            raise ValueError("MiniMax H3 reference videos need at least 5 frames (~0.2s at 24 fps)")
+        vh, vw = int(frames.shape[1]), int(frames.shape[2])
+        try:
+            cw, ch = adapt_canvas(vw, vh)
+        except Exception:
+            cw = max(CANVAS_MULTIPLE, round(vw / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+            ch = max(CANVAS_MULTIPLE, round(vh / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+        if vw * vh < cw * ch:
+            cw = max(CANVAS_MULTIPLE, round(vw / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+            ch = max(CANVAS_MULTIPLE, round(vh / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+        frames = _resize(frames, cw, ch, "disabled")
+        if frames.shape[0] > frame_count:
+            frames = frames[:frame_count]
+        n = int(frames.shape[0])
+        while n % 17 != 5 and n >= 5:
+            n -= 1
+        frames = frames[:n]
+        if soundtrack is not None:
+            ref_items.append({"type": "audio"})
+        step = max(1, FPS // 2)
+        sample_idx = list(range(0, frames.shape[0], step))
+        ref_items.append({
+            "type": "video",
+            "data": frames[sample_idx],
+            "timestamps": [i / 2.0 for i in range(len(sample_idx))],
+        })
+        z = vae.encode(frames)
+        audio_latent, ref_audio_t = None, 0
+        if soundtrack is not None and audio_vae is not None:
+            audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, soundtrack)
+        ref_blocks.append({
+            "kind": "video_audio" if ref_audio_t else "video",
+            "latent_t": z.shape[2],
+            "latent_h": ch // 16,
+            "latent_w": cw // 16,
+            "ref_audio_t": ref_audio_t,
+            "latent": z,
+            "audio_latent": audio_latent,
+        })
+
+    for audio in extra_audios or ():
+        if audio is None:
+            continue
+        ref_items.append({"type": "audio"})
+        if audio_vae is not None:
+            audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, audio)
+            ref_blocks.append({
+                "kind": "audio",
+                "ref_audio_t": ref_audio_t,
+                "audio_latent": audio_latent,
+            })
 
     tokens = clip.tokenize(prompt, minimax_ref_items=ref_items)
     cond = clip.encode_from_tokens_scheduled(tokens)
